@@ -8,7 +8,10 @@ from pydantic import BaseModel
 from typing import List, Optional
 
 # Import routing optimizer
-from backend.optimizer import optimize_patrol_route
+try:
+    from backend.optimizer import optimize_patrol_route
+except ModuleNotFoundError:
+    from optimizer import optimize_patrol_route
 
 app = FastAPI(title="AI Parking Congestion Intelligence API")
 
