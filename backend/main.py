@@ -64,53 +64,58 @@ else:
     locations_db = {}
     print(f"Warning: {LOCATIONS_PATH} not found.")
 
-# Load ONNX Model and Metadata
+# Model variables initialized globally (loaded lazily to prevent Vercel serverless cold-start timeouts)
 startup_error = None
 runtime_mode = "native-heuristic-fallback"
 onnx_session = None
-feature_names = []
+feature_names = [
+    'latitude', 'longitude', 'hour', 'day_of_week', 'vehicle_type_encoded', 
+    'nearest_hotspot_dist', 'nearest_hotspot_density', 'dist_to_metro', 'dist_to_commercial'
+]
 cluster_centers = np.array([])
 label_encoder_classes = []
+model_loaded = False
 
-if os.path.exists(ONNX_MODEL_PATH) and os.path.exists(META_PATH):
-    try:
-        import onnxruntime as ort
-        # Load metadata
-        with open(META_PATH, 'r') as f:
-            meta_data = json.load(f)
-            feature_names = meta_data.get('features', [])
-            label_encoder_classes = meta_data.get('label_encoder_classes', [])
-            raw_cluster_centers = meta_data.get('cluster_centers', [])
-            if raw_cluster_centers:
-                cluster_centers = np.array(raw_cluster_centers)
-        
-        # Load ONNX model session
-        onnx_session = ort.InferenceSession(ONNX_MODEL_PATH)
-        runtime_mode = "onnx"
-    except Exception as e:
-        import traceback
-        startup_error = f"Error loading ONNX model: {e}\n{traceback.format_exc()}"
+def load_onnx_model_lazy():
+    global onnx_session, feature_names, cluster_centers, label_encoder_classes, model_loaded, startup_error, runtime_mode
+    if model_loaded:
+        return
+    
+    if os.path.exists(ONNX_MODEL_PATH) and os.path.exists(META_PATH):
+        try:
+            import onnxruntime as ort
+            # Load metadata
+            with open(META_PATH, 'r') as f:
+                meta_data = json.load(f)
+                feature_names = meta_data.get('features', feature_names)
+                label_encoder_classes = meta_data.get('label_encoder_classes', [])
+                raw_cluster_centers = meta_data.get('cluster_centers', [])
+                if raw_cluster_centers:
+                    cluster_centers = np.array(raw_cluster_centers)
+            
+            # Load ONNX model session
+            onnx_session = ort.InferenceSession(ONNX_MODEL_PATH)
+            runtime_mode = "onnx"
+            model_loaded = True
+        except Exception as e:
+            import traceback
+            startup_error = f"Error loading ONNX model: {e}\n{traceback.format_exc()}"
+            print(startup_error)
+            onnx_session = None
+            runtime_mode = "native-heuristic-fallback"
+            model_loaded = True # mark as attempted
+    else:
+        startup_error = f"Warning: ONNX model or meta file not found at {ONNX_MODEL_PATH} or {META_PATH}."
         print(startup_error)
-        onnx_session = None
-        feature_names = [
-            'latitude', 'longitude', 'hour', 'day_of_week', 'vehicle_type_encoded', 
-            'nearest_hotspot_dist', 'nearest_hotspot_density', 'dist_to_metro', 'dist_to_commercial'
-        ]
-else:
-    onnx_session = None
-    feature_names = [
-        'latitude', 'longitude', 'hour', 'day_of_week', 'vehicle_type_encoded', 
-        'nearest_hotspot_dist', 'nearest_hotspot_density', 'dist_to_metro', 'dist_to_commercial'
-    ]
-    startup_error = f"Warning: ONNX model or meta file not found at {ONNX_MODEL_PATH} or {META_PATH}."
-    print(startup_error)
+        runtime_mode = "native-heuristic-fallback"
+        model_loaded = True
 
-# Reconstruct cluster_centers if not loaded from meta JSON but hotspots_db is available
-if (cluster_centers is None or len(cluster_centers) == 0 or not isinstance(cluster_centers, np.ndarray)) and hotspots_db:
-    try:
-        cluster_centers = np.array([[c['cluster_id'], c['location'][0], c['location'][1], c['hotspot_score'], c['violation_count']] for c in hotspots_db])
-    except Exception as e:
-        print(f"Error reconstructing cluster_centers: {e}")
+    # Reconstruct cluster_centers if not loaded from meta JSON but hotspots_db is available
+    if (cluster_centers is None or len(cluster_centers) == 0 or not isinstance(cluster_centers, np.ndarray)) and hotspots_db:
+        try:
+            cluster_centers = np.array([[c['cluster_id'], c['location'][0], c['location'][1], c['hotspot_score'], c['violation_count']] for c in hotspots_db])
+        except Exception as e:
+            print(f"Error reconstructing cluster_centers: {e}")
 
 
 VEHICLE_WEIGHTS = {
@@ -174,8 +179,10 @@ class RoutingRequest(BaseModel):
     location: Optional[List[float]] = None
 
 @app.get("/api/health")
-def health_check():
+def health_check(warm: Optional[bool] = False):
     import sys
+    if warm:
+        load_onnx_model_lazy()
     return {
         "status": "ok",
         "cwd": os.getcwd(),
@@ -186,6 +193,7 @@ def health_check():
         "has_hotspots": bool(hotspots_db),
         "has_locations": bool(locations_db),
         "has_model": onnx_session is not None,
+        "model_files_present": os.path.exists(ONNX_MODEL_PATH) and os.path.exists(META_PATH),
         "runtime_mode": runtime_mode,
         "startup_error": startup_error,
         "hotspots_error": hotspots_error,
@@ -220,6 +228,7 @@ def get_locations():
 
 @app.post("/api/predict")
 def predict_traffic_impact(req: PredictionRequest):
+    load_onnx_model_lazy()
     if len(req.location) != 2:
         raise HTTPException(status_code=400, detail="Invalid location coordinates format.")
         
