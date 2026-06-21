@@ -1,6 +1,5 @@
 import os
 import json
-import pickle
 import numpy as np
 from fastapi import FastAPI, HTTPException
 from fastapi.staticfiles import StaticFiles
@@ -16,7 +15,8 @@ except ModuleNotFoundError:
 app = FastAPI(title="AI Parking Congestion Intelligence API")
 
 # Load precalculated assets relative to project root (works 100% reliably in serverless environments)
-MODEL_PATH = os.path.join(os.getcwd(), "backend", "parking_ml_model.pkl")
+ONNX_MODEL_PATH = os.path.join(os.getcwd(), "backend", "parking_ml_model.onnx")
+META_PATH = os.path.join(os.getcwd(), "backend", "parking_ml_model_meta.json")
 CLUSTERS_PATH = os.path.join(os.getcwd(), "backend", "hotspot_clusters.json")
 STATS_PATH = os.path.join(os.getcwd(), "backend", "overall_stats.json")
 LOCATIONS_PATH = os.path.join(os.getcwd(), "backend", "locations_db.json")
@@ -64,31 +64,53 @@ else:
     locations_db = {}
     print(f"Warning: {LOCATIONS_PATH} not found.")
 
-# Load ML Model
+# Load ONNX Model and Metadata
 startup_error = None
-if os.path.exists(MODEL_PATH):
+runtime_mode = "native-heuristic-fallback"
+onnx_session = None
+feature_names = []
+cluster_centers = np.array([])
+label_encoder_classes = []
+
+if os.path.exists(ONNX_MODEL_PATH) and os.path.exists(META_PATH):
     try:
-        with open(MODEL_PATH, 'rb') as f:
-            model_data = pickle.load(f)
-            ml_model = model_data['model']
-            feature_names = model_data['features']
-            cluster_centers = model_data['cluster_centers']
-            label_encoder_classes = model_data.get('label_encoder_classes', [])
+        import onnxruntime as ort
+        # Load metadata
+        with open(META_PATH, 'r') as f:
+            meta_data = json.load(f)
+            feature_names = meta_data.get('features', [])
+            label_encoder_classes = meta_data.get('label_encoder_classes', [])
+            raw_cluster_centers = meta_data.get('cluster_centers', [])
+            if raw_cluster_centers:
+                cluster_centers = np.array(raw_cluster_centers)
+        
+        # Load ONNX model session
+        onnx_session = ort.InferenceSession(ONNX_MODEL_PATH)
+        runtime_mode = "onnx"
     except Exception as e:
         import traceback
-        startup_error = f"Error loading ML model: {e}\n{traceback.format_exc()}"
+        startup_error = f"Error loading ONNX model: {e}\n{traceback.format_exc()}"
         print(startup_error)
-        ml_model = None
-        feature_names = []
-        cluster_centers = []
-        label_encoder_classes = []
+        onnx_session = None
+        feature_names = [
+            'latitude', 'longitude', 'hour', 'day_of_week', 'vehicle_type_encoded', 
+            'nearest_hotspot_dist', 'nearest_hotspot_density', 'dist_to_metro', 'dist_to_commercial'
+        ]
 else:
-    ml_model = None
-    feature_names = []
-    cluster_centers = []
-    label_encoder_classes = []
-    startup_error = f"Warning: {MODEL_PATH} not found."
+    onnx_session = None
+    feature_names = [
+        'latitude', 'longitude', 'hour', 'day_of_week', 'vehicle_type_encoded', 
+        'nearest_hotspot_dist', 'nearest_hotspot_density', 'dist_to_metro', 'dist_to_commercial'
+    ]
+    startup_error = f"Warning: ONNX model or meta file not found at {ONNX_MODEL_PATH} or {META_PATH}."
     print(startup_error)
+
+# Reconstruct cluster_centers if not loaded from meta JSON but hotspots_db is available
+if (cluster_centers is None or len(cluster_centers) == 0 or not isinstance(cluster_centers, np.ndarray)) and hotspots_db:
+    try:
+        cluster_centers = np.array([[c['cluster_id'], c['location'][0], c['location'][1], c['hotspot_score'], c['violation_count']] for c in hotspots_db])
+    except Exception as e:
+        print(f"Error reconstructing cluster_centers: {e}")
 
 
 VEHICLE_WEIGHTS = {
@@ -163,13 +185,15 @@ def health_check():
         "has_stats": bool(overall_stats),
         "has_hotspots": bool(hotspots_db),
         "has_locations": bool(locations_db),
-        "has_model": ml_model is not None,
+        "has_model": onnx_session is not None,
+        "runtime_mode": runtime_mode,
         "startup_error": startup_error,
         "hotspots_error": hotspots_error,
         "stats_error": stats_error,
         "locations_error": locations_error,
         "paths": {
-            "model": MODEL_PATH,
+            "model": ONNX_MODEL_PATH,
+            "metadata": META_PATH,
             "clusters": CLUSTERS_PATH,
             "stats": STATS_PATH,
             "locations": LOCATIONS_PATH
@@ -222,39 +246,48 @@ def predict_traffic_impact(req: PredictionRequest):
     comm_dists = [haversine_distance(lat, lon, c[0], c[1]) for c in COMMERCIAL_HUBS]
     dist_to_commercial = float(np.min(comm_dists))
 
-    # Run ML prediction if model is loaded
-    if ml_model:
-        # Encode vehicle_type using the saved classes list
-        v_type = str(req.vehicle_type).upper()
-        if label_encoder_classes:
-            if v_type not in label_encoder_classes:
-                # fallback to closest match or first
-                matches = [c for c in label_encoder_classes if v_type in c or c in v_type]
-                if matches:
-                    v_type = matches[0]
-                else:
-                    v_type = label_encoder_classes[0]
-            v_encoded = label_encoder_classes.index(v_type)
-        else:
-            v_encoded = 0
+    # Run ML prediction if ONNX session is loaded
+    pred_tis = None
+    if onnx_session:
+        try:
+            # Encode vehicle_type using the saved classes list
+            v_type = str(req.vehicle_type).upper()
+            if label_encoder_classes:
+                if v_type not in label_encoder_classes:
+                    # fallback to closest match or first
+                    matches = [c for c in label_encoder_classes if v_type in c or c in v_type]
+                    if matches:
+                        v_type = matches[0]
+                    else:
+                        v_type = label_encoder_classes[0]
+                v_encoded = label_encoder_classes.index(v_type)
+            else:
+                v_encoded = 0
+                
+            feature_dict = {
+                'latitude': lat,
+                'longitude': lon,
+                'hour': req.hour,
+                'day_of_week': req.day_of_week,
+                'vehicle_type_encoded': v_encoded,
+                'nearest_hotspot_dist': nearest_dist,
+                'nearest_hotspot_density': nearest_density,
+                'dist_to_metro': dist_to_metro,
+                'dist_to_commercial': dist_to_commercial
+            }
             
-        feature_dict = {
-            'latitude': lat,
-            'longitude': lon,
-            'hour': req.hour,
-            'day_of_week': req.day_of_week,
-            'vehicle_type_encoded': v_encoded,
-            'nearest_hotspot_dist': nearest_dist,
-            'nearest_hotspot_density': nearest_density,
-            'dist_to_metro': dist_to_metro,
-            'dist_to_commercial': dist_to_commercial
-        }
-        
-        # Build features in same order
-        X = np.array([[feature_dict[col] for col in feature_names]])
-        pred_tis = float(ml_model.predict(X)[0])
-    else:
-        # Fallback to simple heuristic model if ML pickle not found
+            # Build features in same order as float32 array
+            X = np.array([[feature_dict[col] for col in feature_names]], dtype=np.float32)
+            
+            # Run inference
+            input_name = onnx_session.get_inputs()[0].name
+            pred_tis = onnx_session.run(None, {input_name: X})[0].item()
+        except Exception as e:
+            print(f"ONNX prediction failed: {e}. Falling back to heuristic prediction.")
+            pred_tis = None
+
+    if pred_tis is None:
+        # Fallback to simple heuristic model if ONNX fails or not loaded
         # (0.35 * weight + 0.35 * mr_impact + 0.3 * int_impact) * peak
         v_weight = get_vehicle_weight(req.vehicle_type)
         mr_impact = 1.5 if req.is_main_road == 1 else 0.0

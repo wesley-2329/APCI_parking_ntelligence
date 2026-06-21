@@ -223,16 +223,38 @@ def run_xgb_pipeline():
         pickle.dump(meta, f)
     print(f"Saved metadata to '{META_PATH}'")
 
-    # Save backend-compatible pickle model (without scikit-learn dependency)
-    backend_model_data = {
-        'model': xgb_chrono,
-        'features': features,
-        'label_encoder_classes': list(le.classes_),
-        'cluster_centers': cluster_centers
-    }
-    with open('backend/parking_ml_model.pkl', 'wb') as f:
-        pickle.dump(backend_model_data, f)
-    print("Saved active model to 'backend/parking_ml_model.pkl'")
+    # ------------------ ONNX EXPORT ------------------
+    print("\nConverting model to ONNX format...")
+    try:
+        import onnxmltools
+        from skl2onnx.common.data_types import FloatTensorType
+        
+        # Define the input type: 2D float tensor with shape [None, n_features]
+        n_features = len(features)
+        initial_types = [('input', FloatTensorType([None, n_features]))]
+        
+        # Convert the XGBoost model to ONNX
+        onnx_model = onnxmltools.convert_xgboost(xgb_chrono, initial_types=initial_types)
+        
+        # Save ONNX model
+        onnx_path = 'backend/parking_ml_model.onnx'
+        with open(onnx_path, 'wb') as f:
+            f.write(onnx_model.SerializeToString())
+        print(f"Saved ONNX model to '{onnx_path}'")
+        
+        # Save JSON metadata (replacing parking_ml_model.pkl)
+        meta_json_path = 'backend/parking_ml_model_meta.json'
+        meta_json_data = {
+            'features': features,
+            'label_encoder_classes': list(le.classes_),
+            'cluster_centers': cluster_centers.tolist()
+        }
+        with open(meta_json_path, 'w') as f:
+            json.dump(meta_json_data, f)
+        print(f"Saved JSON metadata to '{meta_json_path}'")
+        
+    except Exception as e:
+        print(f"Failed to export model to ONNX: {e}")
 
 if __name__ == "__main__":
     run_xgb_pipeline()

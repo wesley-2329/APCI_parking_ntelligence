@@ -2,4 +2,4 @@ numpy
 fastapi
 uvicorn
 jinja2
-xgboost
+onnxruntime
