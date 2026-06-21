@@ -93,8 +93,15 @@ def load_onnx_model_lazy():
                 if raw_cluster_centers:
                     cluster_centers = np.array(raw_cluster_centers)
             
+            # Configure session options to prevent deadlocks and spinning in restricted serverless container (Vercel/Lambda)
+            sess_options = ort.SessionOptions()
+            sess_options.intra_op_num_threads = 1
+            sess_options.inter_op_num_threads = 1
+            sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
+            sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
+
             # Load ONNX model session
-            onnx_session = ort.InferenceSession(ONNX_MODEL_PATH)
+            onnx_session = ort.InferenceSession(ONNX_MODEL_PATH, sess_options)
             runtime_mode = "onnx"
             model_loaded = True
         except Exception as e:
