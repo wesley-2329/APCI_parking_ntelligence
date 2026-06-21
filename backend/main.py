@@ -100,8 +100,8 @@ def load_onnx_model_lazy():
             sess_options.execution_mode = ort.ExecutionMode.ORT_SEQUENTIAL
             sess_options.add_session_config_entry("session.intra_op.allow_spinning", "0")
 
-            # Load ONNX model session
-            onnx_session = ort.InferenceSession(ONNX_MODEL_PATH, sess_options)
+            # Load ONNX model session, explicitly specifying CPUExecutionProvider to prevent slow startups/search timeouts
+            onnx_session = ort.InferenceSession(ONNX_MODEL_PATH, sess_options, providers=['CPUExecutionProvider'])
             runtime_mode = "onnx"
             model_loaded = True
         except Exception as e:
